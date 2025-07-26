@@ -1,13 +1,14 @@
 <?php
-// Telegram Welcome Bot
-// Admin ID and Token configuration
+// Telegram Welcome Bot with per-channel settings
+
 $bot_token = getenv('BOT_TOKEN') ?: '7954391684:AAEUOWnBMhLb1BbR7uBOsI_ETTLQ5v_9jBs';
 $admin_id  = intval(getenv('ADMIN_ID') ?: 7505722949);
 
-// API request helper
-function apiRequest(string $method, array $params = []) {
+function apiRequest(string $method, array $params = [], ?string $token = null)
+{
     global $bot_token;
-    $url = "https://api.telegram.org/bot{$bot_token}/" . $method;
+    $token = $token ?: $bot_token;
+    $url = "https://api.telegram.org/bot{$token}/" . $method;
     $options = [
         'http' => [
             'header'  => "Content-Type: application/json\r\n",
@@ -19,31 +20,62 @@ function apiRequest(string $method, array $params = []) {
     return json_decode(file_get_contents($url, false, $context), true);
 }
 
-// Data helpers
+// --- Data helpers ---
+
 define('DATA_DIR', __DIR__ . '/data');
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0777, true);
 }
 
-function loadChannels(): array {
-    $file = DATA_DIR . '/channels.json';
-    if (!file_exists($file)) return [];
+function channelFile(int|string $id): string
+{
+    return DATA_DIR . "/{$id}.json";
+}
+
+function loadChannel(int|string $id): array
+{
+    $file = channelFile($id);
+    if (!file_exists($file)) {
+        return [];
+    }
     return json_decode(file_get_contents($file), true) ?: [];
 }
 
-function saveChannels(array $channels): void {
-    $file = DATA_DIR . '/channels.json';
-    file_put_contents($file, json_encode($channels, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+function saveChannel(int|string $id, array $data): void
+{
+    $file = channelFile($id);
+    file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
 
-function loadState(int $user_id) {
-    $file = DATA_DIR . "/state_{$user_id}.json";
+function listChannels(): array
+{
+    $channels = [];
+    foreach (glob(DATA_DIR . '/*.json') as $file) {
+        $name = basename($file, '.json');
+        if (str_starts_with($name, 'state_')) {
+            continue;
+        }
+        $data = json_decode(file_get_contents($file), true);
+        $channels[$name] = $data['title'] ?? $name;
+    }
+    return $channels;
+}
+
+function stateFile(int $user_id): string
+{
+    return DATA_DIR . "/state_{$user_id}.json";
+}
+
+function loadState(int $user_id)
+{
+    $file = stateFile($user_id);
     if (!file_exists($file)) return null;
     return json_decode(file_get_contents($file), true);
 }
 
-function saveState(int $user_id, $state): void {
-    $file = DATA_DIR . "/state_{$user_id}.json";
+function saveState(int $user_id, $state): void
+{
+    $file = stateFile($user_id);
     if ($state === null) {
         if (file_exists($file)) unlink($file);
         return;
@@ -51,40 +83,53 @@ function saveState(int $user_id, $state): void {
     file_put_contents($file, json_encode($state));
 }
 
-function defaultKeyboard(): array {
+function defaultKeyboard(): array
+{
     return [
         'keyboard' => [["/start"]],
-        'resize_keyboard' => true
+        'resize_keyboard' => true,
     ];
 }
 
-function sendWelcomeMessage(int $user_id, int $channel_id, string $channel_title): void {
-    $channels = loadChannels();
-    $settings = $channels[$channel_id] ?? [
-        'title' => $channel_title,
-        'welcome' => "👇 مرحبًا بك صديقي! تقدر تزور موقعنا:",
-        'buttons' => [
-            ['text' => '🔗 زور موقعنا', 'url' => 'https://his-lawyer.com'],
-            ['text' => '🔥 رابط آخر', 'url' => 'https://example.com'],
-        ],
-    ];
-    $channels[$channel_id] = $settings;
-    saveChannels($channels);
+function sendWelcomeMessage(int $user_id, int $channel_id, string $channel_title): void
+{
+    $settings = loadChannel($channel_id);
+    if (!$settings) {
+        $settings = [
+            'title' => $channel_title,
+            'welcome_message' => "👇 مرحبًا بك صديقي! تقدر تزور موقعنا:",
+            'buttons' => [
+                ['label' => '🔗 زور موقعنا', 'url' => 'https://his-lawyer.com'],
+                ['label' => '🔥 رابط آخر', 'url' => 'https://example.com'],
+            ],
+            'custom_bot_token' => ''
+        ];
+        saveChannel($channel_id, $settings);
+    }
 
-    $keyboard = ['inline_keyboard' => array_map(
-        fn($b) => [['text' => $b['text'], 'url' => $b['url']]],
-        $settings['buttons']
-    )];
+    $keyboard = ['inline_keyboard' => []];
+    foreach ($settings['buttons'] as $b) {
+        $keyboard['inline_keyboard'][] = [['text' => $b['label'], 'url' => $b['url']]];
+    }
+
+    $token = $settings['custom_bot_token'] ?: null;
+
     apiRequest('sendMessage', [
         'chat_id' => $user_id,
-        'text' => $settings['welcome'],
+        'text' => $settings['welcome_message'],
         'reply_markup' => $keyboard,
-    ]);
+    ], $token);
 }
 
-$update = json_decode(file_get_contents('php://input'), true);
-if (!$update) { echo 'No update'; exit; }
+// --- Update handling ---
 
+$update = json_decode(file_get_contents('php://input'), true);
+if (!$update) {
+    echo 'No update';
+    exit;
+}
+
+// Handle join requests
 if (isset($update['chat_join_request'])) {
     $req = $update['chat_join_request'];
     $user_id = $req['from']['id'];
@@ -93,194 +138,223 @@ if (isset($update['chat_join_request'])) {
     exit;
 }
 
+// Handle text messages from admin
 if (isset($update['message'])) {
     $message = $update['message'];
     $from_id = $message['from']['id'];
-    $text = $message['text'] ?? '';
+    $text = trim($message['text'] ?? '');
 
     if ($from_id != $admin_id) {
-        exit; // ignore non-admin messages
+        exit; // ignore non-admins
     }
 
     $state = loadState($from_id);
     if ($state) {
-        if ($state['action'] === 'edit_text') {
-            $channels = loadChannels();
-            $channels[$state['channel_id']]['welcome'] = $text;
-            saveChannels($channels);
-            apiRequest('sendMessage', [
-                'chat_id' => $from_id,
-                'text' => 'تم تحديث رسالة الترحيب.',
-                'reply_markup' => defaultKeyboard()
-            ]);
-            saveState($from_id, null);
-            exit;
-        }
-        if ($state['action'] === 'add_button') {
-            if (!strpos($text, '|')) {
+        if ($state['action'] === 'edit_welcome') {
+            if ($state['step'] === 'await_text') {
+                $state['welcome_text'] = $text;
+                $state['buttons'] = [];
+                $state['step'] = 'await_buttons';
+                saveState($from_id, $state);
                 apiRequest('sendMessage', [
                     'chat_id' => $from_id,
-                    'text' => 'الرجاء إرسال النص والرابط بهذا الشكل: اسم الزر | الرابط',
-                    'reply_markup' => defaultKeyboard()
+                    'text' => "أرسل الأزرار بالشكل: اسم الزر | الرابط. أرسل /done عند الانتهاء.",
+                    'reply_markup' => defaultKeyboard(),
                 ]);
                 exit;
             }
-            [$btn_text, $btn_url] = array_map('trim', explode('|', $text, 2));
-            $channels = loadChannels();
-            $channels[$state['channel_id']]['buttons'][] = ['text'=>$btn_text,'url'=>$btn_url];
-            saveChannels($channels);
-            apiRequest('sendMessage', [
-                'chat_id' => $from_id,
-                'text' => 'تم إضافة الزر.',
-                'reply_markup' => defaultKeyboard()
-            ]);
-            saveState($from_id, null);
-            exit;
+            if ($state['step'] === 'await_buttons') {
+                if ($text === '/done') {
+                    $settings = loadChannel($state['channel_id']);
+                    $settings['welcome_message'] = $state['welcome_text'];
+                    $settings['buttons'] = $state['buttons'];
+                    saveChannel($state['channel_id'], $settings);
+                    saveState($from_id, null);
+                    apiRequest('sendMessage', [
+                        'chat_id' => $from_id,
+                        'text' => 'تم حفظ الإعدادات.',
+                        'reply_markup' => defaultKeyboard(),
+                    ]);
+                    exit;
+                }
+                if (!strpos($text, '|')) {
+                    apiRequest('sendMessage', [
+                        'chat_id' => $from_id,
+                        'text' => 'الرجاء إرسال بالصيغة: اسم الزر | الرابط أو /done للإنهاء.',
+                        'reply_markup' => defaultKeyboard(),
+                    ]);
+                    exit;
+                }
+                [$label, $url] = array_map('trim', explode('|', $text, 2));
+                $state['buttons'][] = ['label' => $label, 'url' => $url];
+                saveState($from_id, $state);
+                apiRequest('sendMessage', [
+                    'chat_id' => $from_id,
+                    'text' => 'تم إضافة الزر، أرسل زرًا آخر أو /done للإنهاء.',
+                    'reply_markup' => defaultKeyboard(),
+                ]);
+                exit;
+            }
+        }
+        if ($state['action'] === 'set_bot') {
+            if ($state['step'] === 'ask_use') {
+                $lower = mb_strtolower($text);
+                if (in_array($lower, ['نعم', 'yes', 'y'])) {
+                    $state['step'] = 'await_token';
+                    saveState($from_id, $state);
+                    apiRequest('sendMessage', [
+                        'chat_id' => $from_id,
+                        'text' => 'أرسل توكن البوت المخصص.',
+                        'reply_markup' => defaultKeyboard(),
+                    ]);
+                    exit;
+                } elseif (in_array($lower, ['لا', 'no', 'n'])) {
+                    $settings = loadChannel($state['channel_id']);
+                    $settings['custom_bot_token'] = '';
+                    saveChannel($state['channel_id'], $settings);
+                    saveState($from_id, null);
+                    apiRequest('sendMessage', [
+                        'chat_id' => $from_id,
+                        'text' => 'تم الاعتماد على البوت الحالي.',
+                        'reply_markup' => defaultKeyboard(),
+                    ]);
+                    exit;
+                } else {
+                    apiRequest('sendMessage', [
+                        'chat_id' => $from_id,
+                        'text' => 'الرجاء الإجابة بنعم أو لا.',
+                        'reply_markup' => defaultKeyboard(),
+                    ]);
+                    exit;
+                }
+            }
+            if ($state['step'] === 'await_token') {
+                $token = $text;
+                $settings = loadChannel($state['channel_id']);
+                $settings['custom_bot_token'] = $token;
+                saveChannel($state['channel_id'], $settings);
+                saveState($from_id, null);
+                apiRequest('sendMessage', [
+                    'chat_id' => $from_id,
+                    'text' => 'تم حفظ التوكن المخصص.',
+                    'reply_markup' => defaultKeyboard(),
+                ]);
+                exit;
+            }
         }
     }
 
     if ($text === '/start') {
-        // show persistent start button
         apiRequest('sendMessage', [
             'chat_id' => $from_id,
             'text' => 'القائمة الرئيسية',
-            'reply_markup' => defaultKeyboard()
+            'reply_markup' => defaultKeyboard(),
         ]);
 
-        $channels = loadChannels();
+        $channels = listChannels();
         if (!$channels) {
             apiRequest('sendMessage', [
-                'chat_id'=>$from_id,
-                'text'=>'لا توجد قنوات حالياً.',
-                'reply_markup' => defaultKeyboard()
+                'chat_id' => $from_id,
+                'text' => 'لا توجد قنوات حالياً.',
+                'reply_markup' => defaultKeyboard(),
             ]);
             exit;
         }
-        $keyboard = ['inline_keyboard'=>[]];
-        foreach ($channels as $id => $ch) {
-            $keyboard['inline_keyboard'][] = [['text'=>$ch['title'],'callback_data'=>'channel_'.$id]];
+        $keyboard = ['inline_keyboard' => []];
+        foreach ($channels as $id => $title) {
+            $keyboard['inline_keyboard'][] = [[
+                'text' => $title,
+                'callback_data' => 'ch_' . $id,
+            ]];
         }
-        apiRequest('sendMessage', ['chat_id'=>$from_id,'text'=>'اختر القناة:','reply_markup'=>$keyboard]);
+        apiRequest('sendMessage', [
+            'chat_id' => $from_id,
+            'text' => 'اختر القناة:',
+            'reply_markup' => $keyboard,
+        ]);
         exit;
     }
 }
 
+// Handle callbacks from admin
 if (isset($update['callback_query'])) {
     $callback = $update['callback_query'];
     $data = $callback['data'];
     $from_id = $callback['from']['id'];
     $message_id = $callback['message']['message_id'];
 
-    if ($from_id != $admin_id) exit;
-
-    if (strpos($data,'channel_') === 0) {
-        $channel_id = substr($data,8);
-        $channels = loadChannels();
-        $ch = $channels[$channel_id];
-        $keyboard = [
-            'inline_keyboard' => [
-                [['text'=>'تعديل الترحيب','callback_data'=>'edittext_'.$channel_id]],
-                [['text'=>'إضافة زر','callback_data'=>'addbutton_'.$channel_id]],
-                [['text'=>'حذف زر','callback_data'=>'delbutton_'.$channel_id]],
-                [['text'=>'⬅️ رجوع','callback_data'=>'back']]
-            ]
-        ];
-        apiRequest('editMessageText',[
-            'chat_id'=>$from_id,
-            'message_id'=>$message_id,
-            'text'=>'إعدادات القناة: '.$ch['title'],
-            'reply_markup'=>$keyboard
-        ]);
+    if ($from_id != $admin_id) {
         exit;
     }
 
     if ($data === 'back') {
-        $channels = loadChannels();
-        $keyboard = ['inline_keyboard'=>[]];
-        foreach ($channels as $id=>$ch) {
-            $keyboard['inline_keyboard'][] = [['text'=>$ch['title'],'callback_data'=>'channel_'.$id]];
+        $channels = listChannels();
+        $keyboard = ['inline_keyboard' => []];
+        foreach ($channels as $id => $title) {
+            $keyboard['inline_keyboard'][] = [[
+                'text' => $title,
+                'callback_data' => 'ch_' . $id,
+            ]];
         }
-        apiRequest('editMessageText',[
-            'chat_id'=>$from_id,
-            'message_id'=>$message_id,
-            'text'=>'اختر القناة:',
-            'reply_markup'=>$keyboard
+        apiRequest('editMessageText', [
+            'chat_id' => $from_id,
+            'message_id' => $message_id,
+            'text' => 'اختر القناة:',
+            'reply_markup' => $keyboard,
         ]);
+        apiRequest('answerCallbackQuery', ['callback_query_id' => $callback['id']]);
         exit;
     }
 
-    if (strpos($data,'edittext_') === 0) {
-        $channel_id = substr($data,9);
-        saveState($from_id,['action'=>'edit_text','channel_id'=>$channel_id]);
+    if (strpos($data, 'ch_') === 0) {
+        $ch_id = substr($data, 3);
+        $settings = loadChannel($ch_id);
+        $keyboard = [
+            'inline_keyboard' => [
+                [[ 'text' => '✏️ تعديل رسالة الترحيب', 'callback_data' => 'edit_' . $ch_id ]],
+                [[ 'text' => '🤖 تعيين بوت مخصص',    'callback_data' => 'bot_'  . $ch_id ]],
+                [[ 'text' => '⬅️ رجوع', 'callback_data' => 'back' ]],
+            ]
+        ];
+        apiRequest('editMessageText', [
+            'chat_id' => $from_id,
+            'message_id' => $message_id,
+            'text' => 'إعدادات القناة: ' . ($settings['title'] ?? $ch_id),
+            'reply_markup' => $keyboard,
+        ]);
+        apiRequest('answerCallbackQuery', ['callback_query_id' => $callback['id']]);
+        exit;
+    }
+
+    if (strpos($data, 'edit_') === 0) {
+        $ch_id = substr($data, 5);
+        saveState($from_id, [
+            'action' => 'edit_welcome',
+            'channel_id' => $ch_id,
+            'step' => 'await_text',
+        ]);
         apiRequest('sendMessage', [
             'chat_id' => $from_id,
-            'text' => 'أرسل رسالة الترحيب الجديدة.',
-            'reply_markup' => defaultKeyboard()
+            'text' => 'أرسل نص رسالة الترحيب.',
+            'reply_markup' => defaultKeyboard(),
         ]);
+        apiRequest('answerCallbackQuery', ['callback_query_id' => $callback['id']]);
         exit;
     }
 
-    if (strpos($data,'addbutton_') === 0) {
-        $channel_id = substr($data,10);
-        saveState($from_id,['action'=>'add_button','channel_id'=>$channel_id]);
+    if (strpos($data, 'bot_') === 0) {
+        $ch_id = substr($data, 4);
+        saveState($from_id, [
+            'action' => 'set_bot',
+            'channel_id' => $ch_id,
+            'step' => 'ask_use',
+        ]);
         apiRequest('sendMessage', [
             'chat_id' => $from_id,
-            'text' => 'أرسل النص والرابط بهذا الشكل: اسم الزر | الرابط',
-            'reply_markup' => defaultKeyboard()
+            'text' => 'هل تريد استخدام بوت آخر لإرسال رسالة الترحيب؟ (نعم/لا)',
+            'reply_markup' => defaultKeyboard(),
         ]);
-        exit;
-    }
-
-    if (strpos($data,'delbutton_') === 0) {
-        $channel_id = substr($data,10);
-        $channels = loadChannels();
-        $buttons = $channels[$channel_id]['buttons'] ?? [];
-        if (!$buttons) {
-            apiRequest('answerCallbackQuery',['callback_query_id'=>$callback['id'],'text'=>'لا توجد أزرار']);
-            exit;
-        }
-        $keyboard = ['inline_keyboard'=>[]];
-        foreach ($buttons as $i=>$btn) {
-            $keyboard['inline_keyboard'][] = [['text'=>($i+1).'. '.$btn['text'],'callback_data'=>'removebtn_'.$channel_id.'_'.$i]];
-        }
-        $keyboard['inline_keyboard'][] = [['text'=>'⬅️ رجوع','callback_data'=>'channel_'.$channel_id]];
-        apiRequest('editMessageText',[
-            'chat_id'=>$from_id,
-            'message_id'=>$message_id,
-            'text'=>'اختر الزر للحذف:',
-            'reply_markup'=>$keyboard
-        ]);
-        exit;
-    }
-
-    if (strpos($data,'removebtn_') === 0) {
-        [$prefix,$channel_id,$index] = explode('_',$data);
-        $channels = loadChannels();
-        array_splice($channels[$channel_id]['buttons'],$index,1);
-        saveChannels($channels);
-        apiRequest('answerCallbackQuery',['callback_query_id'=>$callback['id'],'text'=>'تم حذف الزر']);
-        // refresh list
-        $buttons = $channels[$channel_id]['buttons'] ?? [];
-        if (!$buttons) {
-            apiRequest('editMessageText',[
-                'chat_id'=>$from_id,
-                'message_id'=>$message_id,
-                'text'=>'لا توجد أزرار.',
-                'reply_markup'=>['inline_keyboard'=>[[['text'=>'⬅️ رجوع','callback_data'=>'channel_'.$channel_id]]]]
-            ]);
-            exit;
-        }
-        $keyboard = ['inline_keyboard'=>[]];
-        foreach ($buttons as $i=>$btn) {
-            $keyboard['inline_keyboard'][] = [['text'=>($i+1).'. '.$btn['text'],'callback_data'=>'removebtn_'.$channel_id.'_'.$i]];
-        }
-        $keyboard['inline_keyboard'][] = [['text'=>'⬅️ رجوع','callback_data'=>'channel_'.$channel_id]];
-        apiRequest('editMessageText',[
-            'chat_id'=>$from_id,
-            'message_id'=>$message_id,
-            'text'=>'اختر الزر للحذف:',
-            'reply_markup'=>$keyboard
-        ]);
+        apiRequest('answerCallbackQuery', ['callback_query_id' => $callback['id']]);
         exit;
     }
 }
